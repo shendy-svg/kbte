@@ -1,11 +1,11 @@
+import os
+import json
+import base64
+
 from fastapi import FastAPI
 from dotenv import load_dotenv
-import os
-import base64
-# Gemini (NEW SDK)
-from google import genai
 
-# Google Drive API
+from google import genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
