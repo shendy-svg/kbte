@@ -4,3 +4,5 @@ google-genai
 google-api-python-client
 google-auth
 python-dotenv
+faiss-cpu
+numpy
