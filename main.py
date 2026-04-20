@@ -4,6 +4,7 @@ import base64
 import numpy as np
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 
 from google import genai
@@ -12,31 +13,34 @@ from googleapiclient.discovery import build
 
 import faiss
 
+# ==============================
+# 🔷 INIT APP
+# ==============================
 app = FastAPI()
 load_dotenv()
 
-# =========================
-# GEMINI
-# =========================
+# ==============================
+# 🔷 GEMINI
+# ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# =========================
-# DRIVE CONFIG
-# =========================
+# ==============================
+# 🔷 DRIVE CONFIG
+# ==============================
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-# =========================
-# VECTOR STORE (FAISS)
-# =========================
+# ==============================
+# 🔷 VECTOR STORE (FAISS)
+# ==============================
 EMBED_DIM = 768
 index = faiss.IndexFlatL2(EMBED_DIM)
 
-chunks = []   # store text chunks
-meta = []     # store metadata (source file)
+chunks = []
+meta = []
 
-# =========================
-# DRIVE AUTH
-# =========================
+# ==============================
+# 🔷 DRIVE AUTH
+# ==============================
 def get_drive_service():
     cred_json = base64.b64decode(os.getenv("GOOGLE_CREDENTIALS_B64"))
     creds_info = json.loads(cred_json)
@@ -48,9 +52,9 @@ def get_drive_service():
 
     return build("drive", "v3", credentials=creds)
 
-# =========================
-# EMBEDDING
-# =========================
+# ==============================
+# 🔷 EMBEDDING
+# ==============================
 def embed(text: str):
     res = client.models.embed_content(
         model="text-embedding-004",
@@ -58,15 +62,15 @@ def embed(text: str):
     )
     return np.array(res.embeddings[0].values, dtype=np.float32)
 
-# =========================
-# CHUNKING
-# =========================
+# ==============================
+# 🔷 CHUNKING
+# ==============================
 def chunk_text(text, size=500):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
-# =========================
-# SYNC DRIVE → VECTOR DB
-# =========================
+# ==============================
+# 🔷 OPTIONAL: SYNC DRIVE (manual trigger)
+# ==============================
 def sync_drive():
     global chunks, meta, index
 
@@ -74,7 +78,7 @@ def sync_drive():
 
     files = service.files().list(
         pageSize=20,
-        fields="files(id, name, modifiedTime)"
+        fields="files(id, name)"
     ).execute().get("files", [])
 
     for f in files:
@@ -87,23 +91,24 @@ def sync_drive():
 
                 index.add(np.array([vec]))
                 chunks.append(c)
-                meta.append({
-                    "file": f["name"],
-                    "id": f["id"]
-                })
+                meta.append({"file": f["name"]})
 
         except Exception as e:
-            print(f"Skip {f['name']} -> {e}")
+            print(f"Skip {f['name']}: {e}")
 
-# =========================
-# SEARCH (VECTOR)
-# =========================
+# ==============================
+# 🔷 SEARCH (VECTOR)
+# ==============================
 def search(query, k=3):
+    if len(chunks) == 0:
+        return []
+
     q_vec = embed(query)
 
     D, I = index.search(np.array([q_vec]), k)
 
     results = []
+
     for i in I[0]:
         if i < len(chunks):
             results.append({
@@ -113,20 +118,16 @@ def search(query, k=3):
 
     return results
 
-# =========================
-# INIT KB (manual trigger)
-# =========================
-@app.get("/sync")
-def sync():
-    sync_drive()
-    return {
-        "status": "synced",
-        "chunks": len(chunks)
-    }
+# ==============================
+# 🔷 ROOT
+# ==============================
+@app.get("/")
+def home():
+    return {"status": "RAG KB AI (Railway Ready)"}
 
-# =========================
-# CHAT (PRODUCTION RAG)
-# =========================
+# ==============================
+# 🔷 CHAT API (RAG)
+# ==============================
 @app.get("/chat")
 def chat(q: str):
 
@@ -139,13 +140,13 @@ def chat(q: str):
     response = client.models.generate_content(
         model="gemini-1.5-flash",
         contents=f"""
-Kamu adalah AI knowledge base internal perusahaan.
+Kamu adalah AI knowledge base internal.
 
-Gunakan konteks berikut:
+Gunakan hanya konteks berikut:
 
 {context}
 
-Jika tidak ada jawaban di konteks, jawab: tidak ditemukan.
+Jika tidak ada di konteks, jawab: tidak ditemukan.
 
 Pertanyaan:
 {q}
@@ -158,9 +159,82 @@ Pertanyaan:
         "sources": [d["meta"]["file"] for d in docs]
     }
 
-# =========================
-# HEALTH
-# =========================
-@app.get("/")
-def home():
-    return {"status": "Production RAG running"}
+# ==============================
+# 🔷 CHAT UI (STEP 9)
+# ==============================
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>KB AI Chat</title>
+        <style>
+            body {
+                font-family: Arial;
+                margin: 40px;
+                background: #f5f5f5;
+            }
+            #chat {
+                border: 1px solid #ccc;
+                background: white;
+                padding: 10px;
+                height: 450px;
+                overflow-y: auto;
+                margin-bottom: 10px;
+            }
+            input {
+                width: 75%;
+                padding: 10px;
+            }
+            button {
+                padding: 10px 15px;
+            }
+            .user { color: blue; margin: 5px 0; }
+            .ai { color: green; margin: 5px 0; }
+        </style>
+    </head>
+    <body>
+
+        <h2>📚 KB AI Chat (Railway + RAG)</h2>
+
+        <div id="chat"></div>
+
+        <input id="msg" placeholder="Tanya sesuatu..." />
+        <button onclick="send()">Send</button>
+
+        <script>
+            async function send() {
+                let msg = document.getElementById("msg").value;
+
+                if (!msg) return;
+
+                document.getElementById("chat").innerHTML +=
+                    "<div class='user'><b>You:</b> " + msg + "</div>";
+
+                let res = await fetch("/chat?q=" + encodeURIComponent(msg));
+                let data = await res.json();
+
+                document.getElementById("chat").innerHTML +=
+                    "<div class='ai'><b>AI:</b> " + data.answer + "</div><br>";
+
+                document.getElementById("msg").value = "";
+
+                document.getElementById("chat").scrollTop =
+                    document.getElementById("chat").scrollHeight;
+            }
+        </script>
+
+    </body>
+    </html>
+    """
+
+# ==============================
+# 🔷 RAILWAY ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+
+    uvicorn.run(app, host="0.0.0.0", port=port)
