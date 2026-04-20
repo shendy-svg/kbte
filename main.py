@@ -16,7 +16,7 @@ from pypdf import PdfReader
 from io import BytesIO
 
 # ==============================
-# 🔷 APP INIT
+# 🔷 INIT
 # ==============================
 app = FastAPI()
 load_dotenv()
@@ -39,7 +39,7 @@ META_PATH = f"{BASE}/meta.json"
 EMBED_DIM = 768
 
 # ==============================
-# 🔷 LOAD FAISS
+# 🔷 LOAD INDEX
 # ==============================
 def load_index():
     if os.path.exists(INDEX_PATH):
@@ -84,36 +84,33 @@ def chunk_text(text, size=800):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
 # ==============================
-# 🔷 PDF PARSER
-# ==============================
-def extract_pdf(file_bytes):
-    reader = PdfReader(BytesIO(file_bytes))
-    return "\n".join([p.extract_text() or "" for p in reader.pages])
-
-# ==============================
-# 🔷 SAFE SEARCH
+# 🔷 SEARCH (SAFE)
 # ==============================
 def search(query, k=5):
 
     if len(chunks) == 0 or index.ntotal == 0:
         return []
 
-    q = embed(query)
-    D, I = index.search(np.array([q]), k)
+    try:
+        q = embed(query)
+        D, I = index.search(np.array([q]), k)
 
-    results = []
+        results = []
 
-    for i in I[0]:
-        if i != -1 and i < len(chunks):
-            results.append({
-                "text": chunks[i],
-                "meta": meta[i]
-            })
+        for i in I[0]:
+            if i != -1 and i < len(chunks):
+                results.append({
+                    "text": chunks[i],
+                    "meta": meta[i]
+                })
 
-    return results
+        return results
+
+    except:
+        return []
 
 # ==============================
-# 🔷 CHAT ENGINE (HYBRID RAG)
+# 🔷 CHAT ENGINE
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -125,19 +122,16 @@ def chat(q: str):
             [f"{d['meta']['file']}: {d['text']}" for d in docs]
         ).strip()
 
-        # ======================
-        # RAG MODE
-        # ======================
-        if len(context) > 50:
+        use_rag = len(context) > 50
 
+        if use_rag:
             prompt = f"""
 You are an enterprise internal AI assistant.
 
-RULES:
-- Use ONLY internal documents
-- Be precise and structured
+Use ONLY internal documents.
 
-FORMAT:
+Answer clearly and structured:
+
 Answer:
 Reasoning:
 Sources:
@@ -148,24 +142,8 @@ DOCUMENTS:
 QUESTION:
 {q}
 """
-
-            res = client.models.generate_content(
-                model=MODEL,
-                contents=prompt
-            )
-
-            return {
-                "mode": "internal-rag",
-                "answer": res.text,
-                "sources": list(set([d["meta"]["file"] for d in docs]))
-            }
-
-        # ======================
-        # EXTERNAL MODE
-        # ======================
-        res = client.models.generate_content(
-            model=MODEL,
-            contents=f"""
+        else:
+            prompt = f"""
 You are a helpful AI assistant.
 
 Answer clearly and structured.
@@ -173,12 +151,16 @@ Answer clearly and structured.
 Question:
 {q}
 """
+
+        res = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
         )
 
         return {
-            "mode": "external-ai",
+            "mode": "internal-rag" if use_rag else "external-ai",
             "answer": res.text,
-            "sources": []
+            "sources": list(set([d["meta"]["file"] for d in docs])) if use_rag else []
         }
 
     except Exception as e:
@@ -196,7 +178,7 @@ def home():
     return {"status": "KB Team East AI running"}
 
 # ==============================
-# 🔷 UI (CLEAN + FIXED DISPLAY)
+# 🔷 UI
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -204,18 +186,18 @@ def ui():
 <!DOCTYPE html>
 <html>
 <head>
-<title>KB Team East AI</title>
+<title>KB AI</title>
 
 <style>
-body {margin:0;font-family:Arial;background:#0b1220;color:#fff;}
-.container {max-width:800px;margin:auto;padding:20px;}
-.chat {height:70vh;overflow-y:auto;background:#111827;padding:15px;border-radius:10px;}
-.msg {margin:10px 0;padding:10px;border-radius:10px;white-space:pre-wrap;}
-.user {background:#2563eb;text-align:right;}
-.ai {background:#1f2937;}
-.input {display:flex;margin-top:10px;}
-input {flex:1;padding:12px;border:none;border-radius:8px;}
-button {margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer;}
+body{margin:0;font-family:Arial;background:#0b1220;color:#fff;}
+.container{max-width:800px;margin:auto;padding:20px;}
+.chat{height:70vh;overflow-y:auto;background:#111827;padding:15px;border-radius:10px;}
+.msg{margin:10px 0;padding:10px;border-radius:10px;white-space:pre-wrap;}
+.user{background:#2563eb;text-align:right;}
+.ai{background:#1f2937;}
+.input{display:flex;margin-top:10px;}
+input{flex:1;padding:12px;border:none;border-radius:8px;outline:none;}
+button{margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer;}
 </style>
 
 </head>
@@ -223,7 +205,7 @@ button {margin-left:10px;padding:12px;background:#22c55e;border:none;border-radi
 <body>
 
 <div class="container">
-<h2>🧠 KB Team East AI</h2>
+<h2>🧠 KB AI</h2>
 
 <div id="chat" class="chat"></div>
 
@@ -236,41 +218,42 @@ button {margin-left:10px;padding:12px;background:#22c55e;border:none;border-radi
 
 <script>
 
-function format(text){
-    return text.replaceAll("\n","<br>");
+const input = document.getElementById("q");
+const chat = document.getElementById("chat");
+
+function add(text, cls){
+    const div = document.createElement("div");
+    div.className = "msg " + cls;
+    div.innerText = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
 }
 
 async function send(){
 
-let q = document.getElementById("q").value;
-if(!q) return;
+    const q = input.value.trim();
+    if(!q) return;
 
-let chat = document.getElementById("chat");
+    add(q,"user");
+    input.value="";
 
-chat.innerHTML += `<div class='msg user'>${q}</div>`;
+    try{
+        const res = await fetch("/chat?q=" + encodeURIComponent(q));
+        const data = await res.json();
 
-let res = await fetch("/chat?q=" + encodeURIComponent(q));
-let data = await res.json();
+        add(data.answer + "\\n\\nmode: " + data.mode, "ai");
 
-chat.innerHTML += `
-<div class='msg ai'>
-${format(data.answer)}
-<br><small>mode: ${data.mode}</small>
-</div>
-`;
-
-document.getElementById("q").value = "";
-chat.scrollTop = chat.scrollHeight;
+    }catch(e){
+        add("Connection error","ai");
+    }
 }
 
-/* ENTER = SEND */
-document.addEventListener("DOMContentLoaded", function () {
-    document.getElementById("q").addEventListener("keypress", function (e) {
-        if (e.key === "Enter") {
-            e.preventDefault();
-            send();
-        }
-    });
+/* ENTER FIX - SUPER STABLE */
+input.addEventListener("keydown", function(e){
+    if(e.key === "Enter"){
+        e.preventDefault();
+        send();
+    }
 });
 
 </script>
