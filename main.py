@@ -12,26 +12,26 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 import faiss
-from pypdf import PdfReader
 from io import BytesIO
 
 # ==============================
-# 🔷 INIT
+# INIT
 # ==============================
 app = FastAPI()
 load_dotenv()
 
 # ==============================
-# 🔷 GEMINI
+# GEMINI
 # ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# 🔥 FIX: model
 MODEL = "gemini-1.5-flash"
 
 # ==============================
-# 🔷 STORAGE
+# STORAGE
 # ==============================
 BASE = "/data"
-
 INDEX_PATH = f"{BASE}/index.faiss"
 CHUNKS_PATH = f"{BASE}/chunks.json"
 META_PATH = f"{BASE}/meta.json"
@@ -39,7 +39,7 @@ META_PATH = f"{BASE}/meta.json"
 EMBED_DIM = 768
 
 # ==============================
-# 🔷 LOAD INDEX
+# LOAD INDEX
 # ==============================
 def load_index():
     if os.path.exists(INDEX_PATH):
@@ -52,7 +52,7 @@ chunks = json.load(open(CHUNKS_PATH)) if os.path.exists(CHUNKS_PATH) else []
 meta = json.load(open(META_PATH)) if os.path.exists(META_PATH) else []
 
 # ==============================
-# 🔷 DRIVE AUTH
+# DRIVE AUTH
 # ==============================
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -68,26 +68,22 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 # ==============================
-# 🔷 EMBEDDING
+# EMBEDDING (SAFE)
 # ==============================
 def embed(text):
-    res = client.models.embed_content(
-        model="text-embedding-004",
-        contents=text
-    )
-    return np.array(res.embeddings[0].values, dtype=np.float32)
+    try:
+        res = client.models.embed_content(
+            model="text-embedding-004",
+            contents=text
+        )
+        return np.array(res.embeddings[0].values, dtype=np.float32)
+    except:
+        return np.zeros((EMBED_DIM,), dtype=np.float32)
 
 # ==============================
-# 🔷 CHUNK
-# ==============================
-def chunk_text(text, size=800):
-    return [text[i:i+size] for i in range(0, len(text), size)]
-
-# ==============================
-# 🔷 SEARCH (SAFE)
+# SEARCH
 # ==============================
 def search(query, k=5):
-
     if len(chunks) == 0 or index.ntotal == 0:
         return []
 
@@ -96,7 +92,6 @@ def search(query, k=5):
         D, I = index.search(np.array([q]), k)
 
         results = []
-
         for i in I[0]:
             if i != -1 and i < len(chunks):
                 results.append({
@@ -105,12 +100,11 @@ def search(query, k=5):
                 })
 
         return results
-
     except:
         return []
 
 # ==============================
-# 🔷 CHAT ENGINE
+# CHAT ENGINE (FIXED RAG LOGIC)
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -122,16 +116,18 @@ def chat(q: str):
             [f"{d['meta']['file']}: {d['text']}" for d in docs]
         ).strip()
 
-        use_rag = len(context) > 50
+        # 🔥 FIX: lebih realistis
+        use_rag = len(docs) > 0
 
         if use_rag:
             prompt = f"""
 You are an enterprise internal AI assistant.
 
-Use ONLY internal documents.
+Rules:
+- Use ONLY internal documents
+- If unsure, say "not found in documents"
 
-Answer clearly and structured:
-
+Answer format:
 Answer:
 Reasoning:
 Sources:
@@ -146,7 +142,7 @@ QUESTION:
             prompt = f"""
 You are a helpful AI assistant.
 
-Answer clearly and structured.
+Answer clearly and concisely.
 
 Question:
 {q}
@@ -160,25 +156,25 @@ Question:
         return {
             "mode": "internal-rag" if use_rag else "external-ai",
             "answer": res.text,
-            "sources": list(set([d["meta"]["file"] for d in docs])) if use_rag else []
+            "sources": list(set([d["meta"]["file"] for d in docs]))
         }
 
     except Exception as e:
+        # 🔥 FIX: tampilkan error asli biar tidak buta
         return {
             "mode": "error",
-            "answer": "AI service temporarily unavailable.",
-            "error": str(e)
+            "answer": str(e)
         }
 
 # ==============================
-# 🔷 ROOT
+# ROOT
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "KB Team East AI running"}
+    return {"status": "KB AI running (stable mode)"}
 
 # ==============================
-# 🔷 UI
+# UI FIXED (ENTER + CLEAN)
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -186,8 +182,7 @@ def ui():
 <!DOCTYPE html>
 <html>
 <head>
-<title>KB AI</title>
-
+<title>KB Team East AI</title>
 <style>
 body{margin:0;font-family:Arial;background:#0b1220;color:#fff;}
 .container{max-width:800px;margin:auto;padding:20px;}
@@ -199,7 +194,6 @@ body{margin:0;font-family:Arial;background:#0b1220;color:#fff;}
 input{flex:1;padding:12px;border:none;border-radius:8px;outline:none;}
 button{margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer;}
 </style>
-
 </head>
 
 <body>
@@ -237,20 +231,15 @@ async function send(){
     add(q,"user");
     input.value="";
 
-    try{
-        const res = await fetch("/chat?q=" + encodeURIComponent(q));
-        const data = await res.json();
+    const res = await fetch("/chat?q=" + encodeURIComponent(q));
+    const data = await res.json();
 
-        add(data.answer + "\\n\\nmode: " + data.mode, "ai");
-
-    }catch(e){
-        add("Connection error","ai");
-    }
+    add(data.answer + "\\n\\nmode: " + data.mode, "ai");
 }
 
-/* ENTER FIX - SUPER STABLE */
-input.addEventListener("keydown", function(e){
-    if(e.key === "Enter"){
+/* ENTER FIX */
+input.addEventListener("keydown", e=>{
+    if(e.key==="Enter"){
         e.preventDefault();
         send();
     }
@@ -263,7 +252,7 @@ input.addEventListener("keydown", function(e){
 """
 
 # ==============================
-# 🔷 RUN
+# RUN
 # ==============================
 if __name__ == "__main__":
     import uvicorn
