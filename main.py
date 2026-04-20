@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import numpy as np
 
 from fastapi import FastAPI
 from dotenv import load_dotenv
@@ -9,72 +10,157 @@ from google import genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
+import faiss
+
 app = FastAPI()
-
-# ==============================
-# 🔷 LOAD ENV
-# ==============================
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
 
-# ==============================
-# 🔷 GEMINI CLIENT
-# ==============================
-client = genai.Client(api_key=api_key)
+# =========================
+# GEMINI
+# =========================
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# ==============================
-# 🔷 GOOGLE DRIVE SETUP
-# ==============================
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+# =========================
+# DRIVE CONFIG
+# =========================
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-def get_drive_files():
+# =========================
+# VECTOR STORE (FAISS)
+# =========================
+EMBED_DIM = 768
+index = faiss.IndexFlatL2(EMBED_DIM)
+
+chunks = []   # store text chunks
+meta = []     # store metadata (source file)
+
+# =========================
+# DRIVE AUTH
+# =========================
+def get_drive_service():
     cred_json = base64.b64decode(os.getenv("GOOGLE_CREDENTIALS_B64"))
-    credentials_info = json.loads(cred_json)
+    creds_info = json.loads(cred_json)
 
     creds = service_account.Credentials.from_service_account_info(
-        credentials_info,
+        creds_info,
         scopes=SCOPES
     )
 
-    service = build('drive', 'v3', credentials=creds)
+    return build("drive", "v3", credentials=creds)
 
-    results = service.files().list(
-        pageSize=10,
-        fields="files(id, name)"
-    ).execute()
+# =========================
+# EMBEDDING
+# =========================
+def embed(text: str):
+    res = client.models.embed_content(
+        model="text-embedding-004",
+        contents=text
+    )
+    return np.array(res.embeddings[0].values, dtype=np.float32)
 
-    return results.get('files', [])
+# =========================
+# CHUNKING
+# =========================
+def chunk_text(text, size=500):
+    return [text[i:i+size] for i in range(0, len(text), size)]
 
-# ==============================
-# 🔷 ROOT
-# ==============================
-@app.get("/")
-def home():
-    return {"status": "KB AI running"}
+# =========================
+# SYNC DRIVE → VECTOR DB
+# =========================
+def sync_drive():
+    global chunks, meta, index
 
-# ==============================
-# 🔷 TEST DRIVE FILES
-# ==============================
-@app.get("/files")
-def list_files():
-    files = get_drive_files()
-    return {"files": files}
+    service = get_drive_service()
 
-# ==============================
-# 🔷 CHAT (BASIC)
-# ==============================
+    files = service.files().list(
+        pageSize=20,
+        fields="files(id, name, modifiedTime)"
+    ).execute().get("files", [])
+
+    for f in files:
+        try:
+            content = service.files().get_media(fileId=f["id"]).execute()
+            text = content.decode("utf-8", errors="ignore")
+
+            for c in chunk_text(text):
+                vec = embed(c)
+
+                index.add(np.array([vec]))
+                chunks.append(c)
+                meta.append({
+                    "file": f["name"],
+                    "id": f["id"]
+                })
+
+        except Exception as e:
+            print(f"Skip {f['name']} -> {e}")
+
+# =========================
+# SEARCH (VECTOR)
+# =========================
+def search(query, k=3):
+    q_vec = embed(query)
+
+    D, I = index.search(np.array([q_vec]), k)
+
+    results = []
+    for i in I[0]:
+        if i < len(chunks):
+            results.append({
+                "text": chunks[i],
+                "meta": meta[i]
+            })
+
+    return results
+
+# =========================
+# INIT KB (manual trigger)
+# =========================
+@app.get("/sync")
+def sync():
+    sync_drive()
+    return {
+        "status": "synced",
+        "chunks": len(chunks)
+    }
+
+# =========================
+# CHAT (PRODUCTION RAG)
+# =========================
 @app.get("/chat")
 def chat(q: str):
 
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=f"""
-        Jawab berdasarkan knowledge base internal.
-        Jika tidak ada, jawab: tidak ditemukan.
+    docs = search(q)
 
-        Pertanyaan:
-        {q}
-        """
+    context = "\n\n".join(
+        [f"{d['meta']['file']}:\n{d['text']}" for d in docs]
     )
 
-    return {"answer": response.text}
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=f"""
+Kamu adalah AI knowledge base internal perusahaan.
+
+Gunakan konteks berikut:
+
+{context}
+
+Jika tidak ada jawaban di konteks, jawab: tidak ditemukan.
+
+Pertanyaan:
+{q}
+"""
+    )
+
+    return {
+        "question": q,
+        "answer": response.text,
+        "sources": [d["meta"]["file"] for d in docs]
+    }
+
+# =========================
+# HEALTH
+# =========================
+@app.get("/")
+def home():
+    return {"status": "Production RAG running"}
