@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import numpy as np
+import traceback
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -20,9 +21,14 @@ app = FastAPI()
 load_dotenv()
 
 # ==============================
-# GEMINI (JANGAN DIUBAH)
+# GEMINI
 # ==============================
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY is missing")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL = "gemini-2.5-flash"
 
 # ==============================
@@ -54,8 +60,13 @@ meta = json.load(open(META_PATH)) if os.path.exists(META_PATH) else []
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 def get_drive_service():
-    cred = base64.b64decode(os.getenv("GOOGLE_CREDENTIALS_B64"))
-    creds_info = json.loads(cred)
+    b64 = os.getenv("GOOGLE_CREDENTIALS_B64")
+
+    if not b64:
+        raise ValueError("GOOGLE_CREDENTIALS_B64 is missing")
+
+    cred_json = base64.b64decode(b64).decode("utf-8")
+    creds_info = json.loads(cred_json)
 
     creds = service_account.Credentials.from_service_account_info(
         creds_info,
@@ -73,48 +84,56 @@ def embed(text):
             model="text-embedding-004",
             contents=text
         )
-        return np.array(res.embeddings[0].values, dtype=np.float32)
-    except:
+
+        # SAFE CHECK
+        if not res.embeddings:
+            return np.zeros((EMBED_DIM,), dtype=np.float32)
+
+        values = res.embeddings[0].values
+
+        return np.array(values, dtype=np.float32)
+
+    except Exception as e:
+        print("EMBED ERROR:", str(e))
         return np.zeros((EMBED_DIM,), dtype=np.float32)
 
 # ==============================
 # SEARCH
 # ==============================
 def search(query, k=5):
-    if len(chunks) == 0 or index.ntotal == 0:
-        return []
-
     try:
-        q = embed(query)
-        D, I = index.search(np.array([q]), k)
+        if len(chunks) == 0 or index.ntotal == 0:
+            return []
+
+        q = embed(query).reshape(1, -1)
+
+        D, I = index.search(q, k)
 
         results = []
         for i in I[0]:
             if i != -1 and i < len(chunks):
                 results.append({
                     "text": chunks[i],
-                    "meta": meta[i]
+                    "meta": meta[i] if i < len(meta) else {"file": "unknown"}
                 })
 
         return results
-    except:
+
+    except Exception as e:
+        print("SEARCH ERROR:", str(e))
         return []
 
 # ==============================
-# CLEAN RESPONSE FORMATTER
+# CLEAN TEXT
 # ==============================
 def clean_text(text: str):
     if not text:
         return "No response"
 
-    return (
-        text.replace("\r", "")
-            .replace("\n\n\n", "\n\n")
-            .strip()
-    )
+    return text.replace("\r", "").strip()
 
 # ==============================
-# CHAT ENGINE (STABLE RAG + CLEAN OUTPUT)
+# CHAT ENGINE
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -134,12 +153,7 @@ You are an enterprise internal AI assistant.
 
 RULES:
 - Use ONLY internal documents
-- If not found, say: "not found in documents"
-
-FORMAT:
-Answer:
-Reasoning:
-Sources:
+- If not found, say: not found in documents
 
 DOCUMENTS:
 {context}
@@ -150,8 +164,6 @@ QUESTION:
         else:
             prompt = f"""
 You are a helpful AI assistant.
-
-Answer clearly, structured, and concise.
 
 QUESTION:
 {q}
@@ -169,20 +181,23 @@ QUESTION:
         }
 
     except Exception as e:
+        print("CHAT ERROR:")
+        print(traceback.format_exc())
+
         return {
             "mode": "error",
-            "answer": "AI service temporarily unavailable."
+            "answer": str(e)
         }
 
 # ==============================
-# ROOT
+# HOME
 # ==============================
 @app.get("/")
 def home():
     return {"status": "KB Team East AI running"}
 
 # ==============================
-# UI (CLEAN CHAT STYLE FIXED)
+# UI
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -191,70 +206,18 @@ def ui():
 <html>
 <head>
 <title>KB Team East AI Chat</title>
-
 <style>
-body{
-    margin:0;
-    font-family:Arial;
-    background:#0b1220;
-    color:#fff;
-}
-
-.container{
-    max-width:800px;
-    margin:auto;
-    padding:20px;
-}
-
-.chat{
-    height:70vh;
-    overflow-y:auto;
-    background:#111827;
-    padding:15px;
-    border-radius:10px;
-}
-
-.msg{
-    margin:10px 0;
-    padding:10px;
-    border-radius:10px;
-    white-space:pre-wrap;
-}
-
-.user{
-    background:#2563eb;
-    text-align:right;
-}
-
-.ai{
-    background:#1f2937;
-}
-
-.input{
-    display:flex;
-    margin-top:10px;
-}
-
-input{
-    flex:1;
-    padding:12px;
-    border:none;
-    border-radius:8px;
-    outline:none;
-}
-
-button{
-    margin-left:10px;
-    padding:12px;
-    background:#22c55e;
-    border:none;
-    border-radius:8px;
-    cursor:pointer;
-}
+body{margin:0;font-family:Arial;background:#0b1220;color:#fff}
+.container{max-width:800px;margin:auto;padding:20px}
+.chat{height:70vh;overflow-y:auto;background:#111827;padding:15px;border-radius:10px}
+.msg{margin:10px 0;padding:10px;border-radius:10px;white-space:pre-wrap}
+.user{background:#2563eb;text-align:right}
+.ai{background:#1f2937}
+.input{display:flex;margin-top:10px}
+input{flex:1;padding:12px;border:none;border-radius:8px}
+button{margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer}
 </style>
-
 </head>
-
 <body>
 
 <div class="container">
@@ -271,49 +234,38 @@ button{
 
 <script>
 
-const input = document.getElementById("q");
-const chat = document.getElementById("chat");
+const input=document.getElementById("q");
+const chat=document.getElementById("chat");
 
-function add(text, cls){
-    const div = document.createElement("div");
-    div.className = "msg " + cls;
-    div.innerText = text;
+function add(text,cls){
+    const div=document.createElement("div");
+    div.className="msg "+cls;
+    div.innerText=text;
     chat.appendChild(div);
-    chat.scrollTop = chat.scrollHeight;
+    chat.scrollTop=chat.scrollHeight;
 }
 
 async function send(){
+    const q=input.value.trim();
+    if(!q)return;
 
-    const q = input.value.trim();
-    if(!q) return;
-
-    add("You: " + q,"user");
+    add("You: "+q,"user");
     input.value="";
 
-    try{
-        const res = await fetch("/chat?q=" + encodeURIComponent(q));
-        const data = await res.json();
+    const res=await fetch("/chat?q="+encodeURIComponent(q));
+    const data=await res.json();
 
-        add(
-            data.answer + "\\n\\n---\\nmode: " + data.mode,
-            "ai"
-        );
-
-    }catch(e){
-        add("Connection error","ai");
-    }
+    add(data.answer + "\\n\\nmode: " + data.mode,"ai");
 }
 
-/* ENTER = SEND FIX */
-input.addEventListener("keydown", function(e){
-    if(e.key === "Enter"){
+input.addEventListener("keydown",(e)=>{
+    if(e.key==="Enter"){
         e.preventDefault();
         send();
     }
 });
 
 </script>
-
 </body>
 </html>
 """
