@@ -16,19 +16,19 @@ from pypdf import PdfReader
 from io import BytesIO
 
 # ==============================
-# 🔷 INIT APP
+# 🔷 APP INIT
 # ==============================
 app = FastAPI()
 load_dotenv()
 
 # ==============================
-# 🔷 GEMINI CLIENT
+# 🔷 GEMINI
 # ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL = "gemini-flash-latest"
 
 # ==============================
-# 🔷 STORAGE (Railway)
+# 🔷 STORAGE
 # ==============================
 BASE = "/data"
 
@@ -84,18 +84,18 @@ def chunk_text(text, size=800):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
 # ==============================
-# 🔷 PDF EXTRACT
+# 🔷 PDF PARSER
 # ==============================
 def extract_pdf(file_bytes):
     reader = PdfReader(BytesIO(file_bytes))
     return "\n".join([p.extract_text() or "" for p in reader.pages])
 
 # ==============================
-# 🔷 SEARCH
+# 🔷 SAFE SEARCH
 # ==============================
 def search(query, k=5):
 
-    if len(chunks) == 0:
+    if len(chunks) == 0 or index.ntotal == 0:
         return []
 
     q = embed(query)
@@ -104,7 +104,7 @@ def search(query, k=5):
     results = []
 
     for i in I[0]:
-        if i < len(chunks):
+        if i != -1 and i < len(chunks):
             results.append({
                 "text": chunks[i],
                 "meta": meta[i]
@@ -113,7 +113,7 @@ def search(query, k=5):
     return results
 
 # ==============================
-# 🔷 CHAT ENGINE (SAFE)
+# 🔷 CHAT ENGINE (HYBRID RAG)
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -122,25 +122,25 @@ def chat(q: str):
         docs = search(q)
 
         context = "\n\n".join(
-            [f"{d['meta']['file']}:\n{d['text']}" for d in docs]
+            [f"{d['meta']['file']}: {d['text']}" for d in docs]
         ).strip()
 
         # ======================
-        # INTERNAL RAG
+        # RAG MODE
         # ======================
-        if context:
+        if len(context) > 50:
 
-            res = client.models.generate_content(
-                model=MODEL,
-                contents=f"""
-You are an enterprise AI assistant.
+            prompt = f"""
+You are an enterprise internal AI assistant.
 
 RULES:
 - Use ONLY internal documents
-- Provide clear answer
-- Provide reasoning
-- Provide suggestions (2-3)
-- Provide sources
+- Be precise and structured
+
+FORMAT:
+Answer:
+Reasoning:
+Sources:
 
 DOCUMENTS:
 {context}
@@ -148,6 +148,10 @@ DOCUMENTS:
 QUESTION:
 {q}
 """
+
+            res = client.models.generate_content(
+                model=MODEL,
+                contents=prompt
             )
 
             return {
@@ -157,16 +161,16 @@ QUESTION:
             }
 
         # ======================
-        # EXTERNAL AI
+        # EXTERNAL MODE
         # ======================
         res = client.models.generate_content(
             model=MODEL,
             contents=f"""
 You are a helpful AI assistant.
 
-Answer the question clearly with reasoning and suggestions.
+Answer clearly and structured.
 
-QUESTION:
+Question:
 {q}
 """
         )
@@ -177,11 +181,11 @@ QUESTION:
             "sources": []
         }
 
-    except Exception:
+    except Exception as e:
         return {
-            "mode": "fallback",
-            "answer": "AI service temporarily unavailable. Please try again.",
-            "sources": []
+            "mode": "error",
+            "answer": "AI service temporarily unavailable.",
+            "error": str(e)
         }
 
 # ==============================
@@ -189,10 +193,10 @@ QUESTION:
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "Enterprise RAG AI running"}
+    return {"status": "KB Team East AI running"}
 
 # ==============================
-# 🔷 UI (CHATGPT STYLE + ENTER FIX)
+# 🔷 UI (CLEAN + FIXED DISPLAY)
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -200,13 +204,13 @@ def ui():
 <!DOCTYPE html>
 <html>
 <head>
-<title>Enterprise RAG AI</title>
+<title>KB Team East AI</title>
 
 <style>
 body {margin:0;font-family:Arial;background:#0b1220;color:#fff;}
 .container {max-width:800px;margin:auto;padding:20px;}
 .chat {height:70vh;overflow-y:auto;background:#111827;padding:15px;border-radius:10px;}
-.msg {margin:10px 0;padding:10px;border-radius:10px;}
+.msg {margin:10px 0;padding:10px;border-radius:10px;white-space:pre-wrap;}
 .user {background:#2563eb;text-align:right;}
 .ai {background:#1f2937;}
 .input {display:flex;margin-top:10px;}
@@ -219,7 +223,7 @@ button {margin-left:10px;padding:12px;background:#22c55e;border:none;border-radi
 <body>
 
 <div class="container">
-<h2>🧠 Enterprise RAG AI</h2>
+<h2>🧠 KB Team East AI</h2>
 
 <div id="chat" class="chat"></div>
 
@@ -231,6 +235,10 @@ button {margin-left:10px;padding:12px;background:#22c55e;border:none;border-radi
 </div>
 
 <script>
+
+function format(text){
+    return text.replaceAll("\n","<br>");
+}
 
 async function send(){
 
@@ -246,7 +254,7 @@ let data = await res.json();
 
 chat.innerHTML += `
 <div class='msg ai'>
-${data.answer}
+${format(data.answer)}
 <br><small>mode: ${data.mode}</small>
 </div>
 `;
@@ -255,7 +263,7 @@ document.getElementById("q").value = "";
 chat.scrollTop = chat.scrollHeight;
 }
 
-/* 🔥 ENTER KEY = SEND */
+/* ENTER = SEND */
 document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("q").addEventListener("keypress", function (e) {
         if (e.key === "Enter") {
