@@ -123,7 +123,7 @@ def search(query, k=3):
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "RAG KB AI (Railway Ready)"}
+    return {"status": "RAG KB-TE AI (Railway Ready)"}
 
 # ==============================
 # 🔷 CHAT API (RAG)
@@ -168,7 +168,7 @@ def ui():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>KB AI Chat</title>
+        <title>KB Team East AI Chat</title>
         <style>
             body {
                 font-family: Arial;
@@ -196,11 +196,11 @@ def ui():
     </head>
     <body>
 
-        <h2>📚 KB AI Chat (Railway + RAG)</h2>
+        <h2>📚 KB Team East AI Chat</h2>
 
         <div id="chat"></div>
 
-        <input id="msg" placeholder="Tanya sesuatu..." />
+        <input id="msg" placeholder="Ask Me..." />
         <button onclick="send()">Send</button>
 
         <script>
