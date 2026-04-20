@@ -3,6 +3,8 @@ import json
 import base64
 import numpy as np
 import traceback
+import time
+import random
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -26,10 +28,12 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY is missing")
+    print("❌ GEMINI_API_KEY missing!")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL = "gemini-2.5-flash"
+
+PRIMARY_MODEL = "gemini-3-flash-preview"
+FALLBACK_MODEL = "gemini-2.5-flash"
 
 # ==============================
 # STORAGE
@@ -63,7 +67,7 @@ def get_drive_service():
     b64 = os.getenv("GOOGLE_CREDENTIALS_B64")
 
     if not b64:
-        raise ValueError("GOOGLE_CREDENTIALS_B64 is missing")
+        raise ValueError("GOOGLE_CREDENTIALS_B64 missing")
 
     cred_json = base64.b64decode(b64).decode("utf-8")
     creds_info = json.loads(cred_json)
@@ -85,20 +89,46 @@ def embed(text):
             contents=text
         )
 
-        # SAFE CHECK
         if not res.embeddings:
             return np.zeros((EMBED_DIM,), dtype=np.float32)
 
-        values = res.embeddings[0].values
-
-        return np.array(values, dtype=np.float32)
+        return np.array(res.embeddings[0].values, dtype=np.float32)
 
     except Exception as e:
-        print("EMBED ERROR:", str(e))
+        print("❌ EMBED ERROR:", str(e))
         return np.zeros((EMBED_DIM,), dtype=np.float32)
 
 # ==============================
-# SEARCH
+# SAFE GEMINI CALL (ANTI 503)
+# ==============================
+def safe_generate(prompt, retries=3):
+
+    models = [PRIMARY_MODEL, FALLBACK_MODEL]
+
+    for model in models:
+        for i in range(retries):
+            try:
+                return client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+
+            except Exception as e:
+                msg = str(e)
+
+                if "503" in msg or "UNAVAILABLE" in msg:
+                    wait = (2 ** i) + random.random()
+                    print(f"⚠️ Model {model} overloaded, retry in {wait:.2f}s")
+                    time.sleep(wait)
+                    continue
+
+                print("❌ GEMINI ERROR:", msg)
+                raise e
+
+    raise Exception("All Gemini models are overloaded")
+
+# ==============================
+# SEARCH (RAG)
 # ==============================
 def search(query, k=5):
     try:
@@ -110,6 +140,7 @@ def search(query, k=5):
         D, I = index.search(q, k)
 
         results = []
+
         for i in I[0]:
             if i != -1 and i < len(chunks):
                 results.append({
@@ -120,7 +151,7 @@ def search(query, k=5):
         return results
 
     except Exception as e:
-        print("SEARCH ERROR:", str(e))
+        print("❌ SEARCH ERROR:", str(e))
         return []
 
 # ==============================
@@ -142,7 +173,7 @@ def chat(q: str):
         docs = search(q)
 
         context = "\n\n".join(
-            [f"{d['meta']['file']}: {d['text']}" for d in docs]
+            [f"{d['meta'].get('file','unknown')}: {d['text']}" for d in docs]
         ).strip()
 
         use_rag = len(docs) > 0
@@ -169,19 +200,16 @@ QUESTION:
 {q}
 """
 
-        res = client.models.generate_content(
-            model=MODEL,
-            contents=prompt
-        )
+        res = safe_generate(prompt)
 
         return {
             "mode": "internal-rag" if use_rag else "external-ai",
             "answer": clean_text(res.text),
-            "sources": list(set([d["meta"]["file"] for d in docs]))
+            "sources": list(set([d["meta"].get("file", "unknown") for d in docs]))
         }
 
     except Exception as e:
-        print("CHAT ERROR:")
+        print("❌ CHAT ERROR:")
         print(traceback.format_exc())
 
         return {
@@ -214,7 +242,7 @@ body{margin:0;font-family:Arial;background:#0b1220;color:#fff}
 .user{background:#2563eb;text-align:right}
 .ai{background:#1f2937}
 .input{display:flex;margin-top:10px}
-input{flex:1;padding:12px;border:none;border-radius:8px}
+input{flex:1;padding:12px;border:none;border-radius:8px;outline:none}
 button{margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer}
 </style>
 </head>
@@ -252,10 +280,15 @@ async function send(){
     add("You: "+q,"user");
     input.value="";
 
-    const res=await fetch("/chat?q="+encodeURIComponent(q));
-    const data=await res.json();
+    try{
+        const res=await fetch("/chat?q="+encodeURIComponent(q));
+        const data=await res.json();
 
-    add(data.answer + "\\n\\nmode: " + data.mode,"ai");
+        add(data.answer + "\\n\\nmode: " + data.mode,"ai");
+
+    }catch(e){
+        add("Connection error","ai");
+    }
 }
 
 input.addEventListener("keydown",(e)=>{
@@ -266,6 +299,7 @@ input.addEventListener("keydown",(e)=>{
 });
 
 </script>
+
 </body>
 </html>
 """
