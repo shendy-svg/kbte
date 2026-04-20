@@ -1,6 +1,8 @@
 import os
 import json
 import base64
+import time
+import threading
 import numpy as np
 
 from fastapi import FastAPI
@@ -38,6 +40,13 @@ index = faiss.IndexFlatL2(EMBED_DIM)
 chunks = []
 meta = []
 
+lock = threading.Lock()
+
+# ==============================
+# 🔷 AUTO SYNC CONFIG
+# ==============================
+SYNC_INTERVAL = 300  # 5 menit
+
 # ==============================
 # 🔷 DRIVE AUTH
 # ==============================
@@ -69,10 +78,12 @@ def chunk_text(text, size=500):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
 # ==============================
-# 🔷 OPTIONAL: SYNC DRIVE (manual trigger)
+# 🔷 SYNC DRIVE → FAISS (FULL REBUILD)
 # ==============================
 def sync_drive():
     global chunks, meta, index
+
+    print("🔄 Syncing Google Drive...")
 
     service = get_drive_service()
 
@@ -80,6 +91,10 @@ def sync_drive():
         pageSize=20,
         fields="files(id, name)"
     ).execute().get("files", [])
+
+    new_chunks = []
+    new_meta = []
+    new_index = faiss.IndexFlatL2(EMBED_DIM)
 
     for f in files:
         try:
@@ -89,12 +104,32 @@ def sync_drive():
             for c in chunk_text(text):
                 vec = embed(c)
 
-                index.add(np.array([vec]))
-                chunks.append(c)
-                meta.append({"file": f["name"]})
+                new_index.add(np.array([vec]))
+                new_chunks.append(c)
+                new_meta.append({"file": f["name"]})
 
         except Exception as e:
             print(f"Skip {f['name']}: {e}")
+
+    # atomic swap (IMPORTANT)
+    with lock:
+        chunks = new_chunks
+        meta = new_meta
+        index = new_index
+
+    print(f"✅ Sync complete. chunks={len(chunks)}")
+
+# ==============================
+# 🔁 AUTO SYNC LOOP
+# ==============================
+def auto_sync_loop():
+    while True:
+        try:
+            sync_drive()
+        except Exception as e:
+            print("❌ Sync error:", e)
+
+        time.sleep(SYNC_INTERVAL)
 
 # ==============================
 # 🔷 SEARCH (VECTOR)
@@ -119,11 +154,27 @@ def search(query, k=3):
     return results
 
 # ==============================
+# 🔷 STARTUP EVENT (AUTO SYNC)
+# ==============================
+@app.on_event("startup")
+def startup_event():
+    print("🚀 Starting KB AI...")
+
+    # initial sync
+    sync_drive()
+
+    # background thread
+    thread = threading.Thread(target=auto_sync_loop, daemon=True)
+    thread.start()
+
+    print("🔁 Auto-sync enabled")
+
+# ==============================
 # 🔷 ROOT
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "RAG KB-TE AI (Railway Ready)"}
+    return {"status": "RAG KB AI AUTO-SYNC RUNNING"}
 
 # ==============================
 # 🔷 CHAT API (RAG)
@@ -138,11 +189,11 @@ def chat(q: str):
     )
 
     response = client.models.generate_content(
-        model="gemini-flash-latest",
-contents=f"""
+        model="gemini-1.5-flash",
+        contents=f"""
 You are an internal knowledge base AI.
 
-Use ONLY the following context to answer the question:
+Use ONLY the following context:
 
 {context}
 
@@ -196,11 +247,11 @@ def ui():
     </head>
     <body>
 
-        <h2>📚 KB Team East AI Chat</h2>
+        <h2>📚 KB Team East AI Chat (Auto-Sync)</h2>
 
         <div id="chat"></div>
 
-        <input id="msg" placeholder="Ask Me..." />
+        <input id="msg" placeholder="Ask me anything..." />
         <button onclick="send()">Send</button>
 
         <script>
