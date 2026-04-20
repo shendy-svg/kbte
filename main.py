@@ -12,7 +12,6 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 import faiss
-from io import BytesIO
 
 # ==============================
 # INIT
@@ -21,11 +20,9 @@ app = FastAPI()
 load_dotenv()
 
 # ==============================
-# GEMINI
+# GEMINI (JANGAN DIUBAH)
 # ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-# 🔥 FIX: model
 MODEL = "gemini-2.5-flash"
 
 # ==============================
@@ -68,7 +65,7 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 # ==============================
-# EMBEDDING (SAFE)
+# EMBEDDING
 # ==============================
 def embed(text):
     try:
@@ -104,7 +101,20 @@ def search(query, k=5):
         return []
 
 # ==============================
-# CHAT ENGINE (FIXED RAG LOGIC)
+# CLEAN RESPONSE FORMATTER
+# ==============================
+def clean_text(text: str):
+    if not text:
+        return "No response"
+
+    return (
+        text.replace("\r", "")
+            .replace("\n\n\n", "\n\n")
+            .strip()
+    )
+
+# ==============================
+# CHAT ENGINE (STABLE RAG + CLEAN OUTPUT)
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -116,18 +126,17 @@ def chat(q: str):
             [f"{d['meta']['file']}: {d['text']}" for d in docs]
         ).strip()
 
-        # 🔥 FIX: lebih realistis
         use_rag = len(docs) > 0
 
         if use_rag:
             prompt = f"""
 You are an enterprise internal AI assistant.
 
-Rules:
+RULES:
 - Use ONLY internal documents
-- If unsure, say "not found in documents"
+- If not found, say: "not found in documents"
 
-Answer format:
+FORMAT:
 Answer:
 Reasoning:
 Sources:
@@ -142,9 +151,9 @@ QUESTION:
             prompt = f"""
 You are a helpful AI assistant.
 
-Answer clearly and concisely.
+Answer clearly, structured, and concise.
 
-Question:
+QUESTION:
 {q}
 """
 
@@ -155,15 +164,14 @@ Question:
 
         return {
             "mode": "internal-rag" if use_rag else "external-ai",
-            "answer": res.text,
+            "answer": clean_text(res.text),
             "sources": list(set([d["meta"]["file"] for d in docs]))
         }
 
     except Exception as e:
-        # 🔥 FIX: tampilkan error asli biar tidak buta
         return {
             "mode": "error",
-            "answer": str(e)
+            "answer": "AI service temporarily unavailable."
         }
 
 # ==============================
@@ -171,10 +179,10 @@ Question:
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "KB AI running (stable mode)"}
+    return {"status": "KB Team East AI running"}
 
 # ==============================
-# UI FIXED (ENTER + CLEAN)
+# UI (CLEAN CHAT STYLE FIXED)
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -182,18 +190,69 @@ def ui():
 <!DOCTYPE html>
 <html>
 <head>
-<title>KB Team East AI</title>
+<title>KB Team East AI Chat</title>
+
 <style>
-body{margin:0;font-family:Arial;background:#0b1220;color:#fff;}
-.container{max-width:800px;margin:auto;padding:20px;}
-.chat{height:70vh;overflow-y:auto;background:#111827;padding:15px;border-radius:10px;}
-.msg{margin:10px 0;padding:10px;border-radius:10px;white-space:pre-wrap;}
-.user{background:#2563eb;text-align:right;}
-.ai{background:#1f2937;}
-.input{display:flex;margin-top:10px;}
-input{flex:1;padding:12px;border:none;border-radius:8px;outline:none;}
-button{margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer;}
+body{
+    margin:0;
+    font-family:Arial;
+    background:#0b1220;
+    color:#fff;
+}
+
+.container{
+    max-width:800px;
+    margin:auto;
+    padding:20px;
+}
+
+.chat{
+    height:70vh;
+    overflow-y:auto;
+    background:#111827;
+    padding:15px;
+    border-radius:10px;
+}
+
+.msg{
+    margin:10px 0;
+    padding:10px;
+    border-radius:10px;
+    white-space:pre-wrap;
+}
+
+.user{
+    background:#2563eb;
+    text-align:right;
+}
+
+.ai{
+    background:#1f2937;
+}
+
+.input{
+    display:flex;
+    margin-top:10px;
+}
+
+input{
+    flex:1;
+    padding:12px;
+    border:none;
+    border-radius:8px;
+    outline:none;
+}
+
+button{
+    margin-left:10px;
+    padding:12px;
+    background:#22c55e;
+    border:none;
+    border-radius:8px;
+    cursor:pointer;
+}
 </style>
+
 </head>
 
 <body>
@@ -228,18 +287,26 @@ async function send(){
     const q = input.value.trim();
     if(!q) return;
 
-    add(q,"user");
+    add("You: " + q,"user");
     input.value="";
 
-    const res = await fetch("/chat?q=" + encodeURIComponent(q));
-    const data = await res.json();
+    try{
+        const res = await fetch("/chat?q=" + encodeURIComponent(q));
+        const data = await res.json();
 
-    add(data.answer + "\\n\\nmode: " + data.mode, "ai");
+        add(
+            data.answer + "\\n\\n---\\nmode: " + data.mode,
+            "ai"
+        );
+
+    }catch(e){
+        add("Connection error","ai");
+    }
 }
 
-/* ENTER FIX */
-input.addEventListener("keydown", e=>{
-    if(e.key==="Enter"){
+/* ENTER = SEND FIX */
+input.addEventListener("keydown", function(e){
+    if(e.key === "Enter"){
         e.preventDefault();
         send();
     }
