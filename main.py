@@ -30,8 +30,8 @@ client = genai.Client(api_key=api_key)
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
 def get_drive_files():
-    creds = service_account.Credentials.from_service_account_file(
-        "kbte-project-c037f84b27a4.json",
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(credentials_json),
         scopes=SCOPES
     )
 
