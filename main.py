@@ -138,17 +138,17 @@ def chat(q: str):
     )
 
     response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=f"""
-Kamu adalah AI knowledge base internal.
+        model="gemini-flash-latest",
+contents=f"""
+You are an internal knowledge base AI.
 
-Gunakan hanya konteks berikut:
+Use ONLY the following context to answer the question:
 
 {context}
 
-Jika tidak ada di konteks, jawab: tidak ditemukan.
+If the answer is not found in the context, respond with: "not found".
 
-Pertanyaan:
+Question:
 {q}
 """
     )
