@@ -25,7 +25,7 @@ load_dotenv()
 # 🔷 GEMINI
 # ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = "gemini-flash-latest"
+MODEL = "gemini-1.5-flash"
 
 # ==============================
 # 🔷 STORAGE
@@ -205,7 +205,7 @@ button{margin-left:10px;padding:12px;background:#22c55e;border:none;border-radiu
 <body>
 
 <div class="container">
-<h2>🧠 KB AI</h2>
+<h2>🧠 KB Team East AI</h2>
 
 <div id="chat" class="chat"></div>
 
