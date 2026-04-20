@@ -24,12 +24,14 @@ app = FastAPI()
 load_dotenv()
 
 # ==============================
-# 🔷 GEMINI
+# 🔷 GEMINI CLIENT (FIXED MODEL)
 # ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+MODEL_NAME = "gemini-flash-latest"
+
 # ==============================
-# 🔷 STORAGE (RAILWAY VOLUME)
+# 🔷 STORAGE (RAILWAY PERSISTENT)
 # ==============================
 BASE = "/data"
 
@@ -48,25 +50,10 @@ def load_index():
         return faiss.read_index(INDEX_PATH)
     return faiss.IndexFlatL2(EMBED_DIM)
 
-def save_index(index):
-    os.makedirs(BASE, exist_ok=True)
-    faiss.write_index(index, INDEX_PATH)
-
 index = load_index()
 
 chunks = json.load(open(CHUNKS_PATH)) if os.path.exists(CHUNKS_PATH) else []
 meta = json.load(open(META_PATH)) if os.path.exists(META_PATH) else []
-
-# ==============================
-# 🔷 STATE (incremental sync)
-# ==============================
-def load_state():
-    if os.path.exists(STATE_PATH):
-        return json.load(open(STATE_PATH))
-    return {}
-
-def save_state(state):
-    json.dump(state, open(STATE_PATH, "w"))
 
 # ==============================
 # 🔷 DRIVE AUTH
@@ -95,20 +82,20 @@ def embed(text):
     return np.array(res.embeddings[0].values, dtype=np.float32)
 
 # ==============================
-# 🔷 CHUNK
+# 🔷 CHUNKING
 # ==============================
 def chunk_text(text, size=800):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
 # ==============================
-# 🔷 PDF EXTRACT
+# 🔷 PDF PARSER
 # ==============================
 def extract_pdf(file_bytes):
     reader = PdfReader(BytesIO(file_bytes))
     return "\n".join([p.extract_text() or "" for p in reader.pages])
 
 # ==============================
-# 🔷 DOWNLOAD + EXPORT DRIVE FILE
+# 🔷 DOWNLOAD FILE FROM DRIVE
 # ==============================
 def download_file(service, file_id, mime):
 
@@ -124,7 +111,7 @@ def download_file(service, file_id, mime):
     return service.files().get_media(fileId=file_id).execute()
 
 # ==============================
-# 🔷 SEARCH
+# 🔷 SEARCH (RAG)
 # ==============================
 def search(query, k=5):
     if len(chunks) == 0:
@@ -133,23 +120,24 @@ def search(query, k=5):
     q = embed(query)
     D, I = index.search(np.array([q]), k)
 
-    res = []
+    results = []
     for i in I[0]:
         if i < len(chunks):
-            res.append({
+            results.append({
                 "text": chunks[i],
                 "meta": meta[i]
             })
-    return res
+
+    return results
 
 # ==============================
-# 🔷 SYNC DRIVE (ENTERPRISE)
+# 🔥 SYNC DRIVE (MANUAL / AUTO READY)
 # ==============================
 def sync_drive():
     global index, chunks, meta
 
     service = get_drive_service()
-    state = load_state()
+    state = {}
 
     files = service.files().list(
         pageSize=100,
@@ -157,15 +145,9 @@ def sync_drive():
     ).execute().get("files", [])
 
     for f in files:
-        fid = f["id"]
-
-        if fid in state and state[fid] == f["modifiedTime"]:
-            continue
-
         try:
-            raw = download_file(service, fid, f["mimeType"])
+            raw = download_file(service, f["id"], f["mimeType"])
 
-            # extract text
             if f["mimeType"] == "application/pdf":
                 text = extract_pdf(raw)
             else:
@@ -184,20 +166,13 @@ def sync_drive():
                     "type": f["mimeType"]
                 })
 
-            state[fid] = f["modifiedTime"]
-
         except Exception as e:
             print("skip:", f["name"], e)
 
-    save_index(index)
-    json.dump(chunks, open(CHUNKS_PATH, "w"))
-    json.dump(meta, open(META_PATH, "w"))
-    save_state(state)
-
-    print("✅ sync done:", len(chunks))
+    print("sync done:", len(chunks))
 
 # ==============================
-# 🔥 CHAT ENGINE (ENTERPRISE)
+# 🔥 CHAT ENGINE (RAG + FALLBACK)
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -208,19 +183,19 @@ def chat(q: str):
         [f"{d['meta']['file']}:\n{d['text']}" for d in docs]
     )
 
-    # =========================
-    # RAG MODE
-    # =========================
+    # ======================
+    # INTERNAL RAG MODE
+    # ======================
     if context.strip():
 
         prompt = f"""
 You are an enterprise AI assistant.
 
 TASK:
-- Answer based on internal documents
+- Answer using internal documents only
 - Provide reasoning
-- Provide citations (file names)
-- Provide 2-3 suggestions
+- Provide sources (file names)
+- Provide suggestions (2-3)
 
 FORMAT:
 Answer:
@@ -236,7 +211,7 @@ QUESTION:
 """
 
         res = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model=MODEL_NAME,
             contents=prompt
         )
 
@@ -246,16 +221,16 @@ QUESTION:
             "sources": list(set([d["meta"]["file"] for d in docs]))
         }
 
-    # =========================
-    # FALLBACK MODE
-    # =========================
+    # ======================
+    # EXTERNAL FALLBACK
+    # ======================
     prompt = f"""
 You are a senior AI assistant.
 
-The question is NOT found in internal knowledge base.
+The question is NOT found in internal documents.
 
 TASK:
-- Answer using general knowledge
+- Answer clearly using general knowledge
 - Provide reasoning
 - Provide suggestions
 
@@ -264,7 +239,7 @@ QUESTION:
 """
 
     res = client.models.generate_content(
-        model="gemini-1.5-flash",
+        model=MODEL_NAME,
         contents=prompt
     )
 
@@ -275,47 +250,133 @@ QUESTION:
     }
 
 # ==============================
-# 🔷 MANUAL SYNC
-# ==============================
-@app.post("/sync")
-def manual_sync():
-    sync_drive()
-    return {"status": "synced"}
-
-# ==============================
-# 🔷 ROOT
+# 🔥 ROOT
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "Enterprise RAG AI running"}
+    return {"status": "KB Team East AI running"}
 
 # ==============================
-# 🔷 SIMPLE UI
+# 🔥 UI (CHATGPT STYLE FIXED)
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
     return """
-    <html>
-    <body>
-    <h2>Enterprise AI RAG</h2>
+<!DOCTYPE html>
+<html>
+<head>
+<title>KB Team East AI</title>
 
-    <input id="q" style="width:300px;" placeholder="Ask..." />
-    <button onclick="send()">Send</button>
+<style>
+body {
+    margin:0;
+    font-family: Arial;
+    background:#0b1220;
+    color:white;
+}
 
-    <div id="chat"></div>
+.container {
+    max-width: 800px;
+    margin: auto;
+    padding: 20px;
+}
 
-    <script>
-    async function send(){
-        let q = document.getElementById("q").value;
+.chat {
+    height: 70vh;
+    overflow-y: auto;
+    background: #111827;
+    padding: 15px;
+    border-radius: 10px;
+}
 
-        let r = await fetch("/chat?q=" + q);
-        let d = await r.json();
+.msg {
+    margin: 10px 0;
+    padding: 10px;
+    border-radius: 10px;
+}
 
-        document.getElementById("chat").innerHTML +=
-        "<p><b>You:</b> " + q + "</p>" +
-        "<p><b>AI:</b> " + d.answer + "</p><hr/>";
-    }
-    </script>
-    </body>
-    </html>
-    """
+.user {
+    background:#2563eb;
+    text-align:right;
+}
+
+.ai {
+    background:#1f2937;
+}
+
+.input {
+    display:flex;
+    margin-top:10px;
+}
+
+input {
+    flex:1;
+    padding:12px;
+    border:none;
+    border-radius:8px;
+}
+
+button {
+    margin-left:10px;
+    padding:12px;
+    background:#22c55e;
+    border:none;
+    border-radius:8px;
+    cursor:pointer;
+}
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+<h2>🧠 KB Team East AI</h2>
+
+<div id="chat" class="chat"></div>
+
+<div class="input">
+<input id="q" placeholder="Ask anything..." />
+<button onclick="send()">Send</button>
+</div>
+
+</div>
+
+<script>
+
+async function send(){
+
+let q = document.getElementById("q").value;
+if(!q) return;
+
+let chat = document.getElementById("chat");
+
+chat.innerHTML += `<div class='msg user'>${q}</div>`;
+
+let res = await fetch("/chat?q=" + encodeURIComponent(q));
+let data = await res.json();
+
+chat.innerHTML += `
+<div class='msg ai'>
+${data.answer}
+<br><small>mode: ${data.mode}</small>
+</div>
+`;
+
+document.getElementById("q").value = "";
+chat.scrollTop = chat.scrollHeight;
+}
+
+</script>
+
+</body>
+</html>
+"""
+
+# ==============================
+# 🔥 STARTUP OPTION
+# ==============================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
