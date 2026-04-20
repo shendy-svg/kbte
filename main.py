@@ -17,8 +17,6 @@ app = FastAPI()
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
-print("API KEY:", api_key)
-
 # ==============================
 # 🔷 GEMINI CLIENT
 # ==============================
