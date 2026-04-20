@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from dotenv import load_dotenv
 import os
-
+import base64
 # Gemini (NEW SDK)
 from google import genai
 
@@ -28,8 +28,11 @@ client = genai.Client(api_key=api_key)
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
 def get_drive_files():
+    cred_json = base64.b64decode(os.getenv("GOOGLE_CREDENTIALS_B64"))
+    credentials_info = json.loads(cred_json)
+
     creds = service_account.Credentials.from_service_account_info(
-        json.loads(credentials_json),
+        credentials_info,
         scopes=SCOPES
     )
 
