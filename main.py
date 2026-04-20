@@ -1,9 +1,9 @@
 import os
 import json
 import base64
-import time
-import threading
 import numpy as np
+import threading
+import time
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -14,6 +14,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 import faiss
+from pypdf import PdfReader
+from io import BytesIO
 
 # ==============================
 # 🔷 INIT APP
@@ -27,29 +29,45 @@ load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ==============================
-# 🔷 DRIVE CONFIG
+# 🔷 STORAGE PATH (RAILWAY VOLUME)
 # ==============================
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+BASE_PATH = "/data"
 
-# ==============================
-# 🔷 VECTOR STORE (FAISS)
-# ==============================
+INDEX_PATH = f"{BASE_PATH}/index.faiss"
+CHUNKS_PATH = f"{BASE_PATH}/chunks.json"
+META_PATH = f"{BASE_PATH}/meta.json"
+STATE_PATH = f"{BASE_PATH}/state.json"
+
 EMBED_DIM = 768
-index = faiss.IndexFlatL2(EMBED_DIM)
-
-chunks = []
-meta = []
-
-lock = threading.Lock()
 
 # ==============================
-# 🔷 AUTO SYNC CONFIG
+# 🔷 LOAD OR INIT FAISS
 # ==============================
-SYNC_INTERVAL = 300  # 5 menit
+def load_index():
+    if os.path.exists(INDEX_PATH):
+        return faiss.read_index(INDEX_PATH)
+    return faiss.IndexFlatL2(EMBED_DIM)
+
+def save_index(index):
+    os.makedirs(BASE_PATH, exist_ok=True)
+    faiss.write_index(index, INDEX_PATH)
+
+# ==============================
+# 🔷 STATE
+# ==============================
+def load_state():
+    if os.path.exists(STATE_PATH):
+        return json.load(open(STATE_PATH))
+    return {}
+
+def save_state(state):
+    json.dump(state, open(STATE_PATH, "w"))
 
 # ==============================
 # 🔷 DRIVE AUTH
 # ==============================
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
 def get_drive_service():
     cred_json = base64.b64decode(os.getenv("GOOGLE_CREDENTIALS_B64"))
     creds_info = json.loads(cred_json)
@@ -64,7 +82,7 @@ def get_drive_service():
 # ==============================
 # 🔷 EMBEDDING
 # ==============================
-def embed(text: str):
+def embed(text):
     res = client.models.embed_content(
         model="text-embedding-004",
         contents=text
@@ -72,69 +90,122 @@ def embed(text: str):
     return np.array(res.embeddings[0].values, dtype=np.float32)
 
 # ==============================
-# 🔷 CHUNKING
+# 🔷 CHUNK
 # ==============================
-def chunk_text(text, size=500):
+def chunk_text(text, size=800):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
 # ==============================
-# 🔷 SYNC DRIVE → FAISS (FULL REBUILD)
+# 🔷 TEXT EXTRACTOR
+# ==============================
+def extract_text(file_bytes, mime_type):
+    try:
+        # PDF
+        if mime_type == "application/pdf":
+            reader = PdfReader(BytesIO(file_bytes))
+            return "\n".join([p.extract_text() or "" for p in reader.pages])
+
+        # CSV / Docs export / TXT
+        return file_bytes.decode("utf-8", errors="ignore")
+
+    except Exception as e:
+        print("extract error:", e)
+        return ""
+
+# ==============================
+# 🔷 DOWNLOAD FILE
+# ==============================
+def download_file(service, file_id, mime_type):
+
+    if mime_type == "application/vnd.google-apps.document":
+        return service.files().export_media(
+            fileId=file_id,
+            mimeType="text/plain"
+        ).execute()
+
+    elif mime_type == "application/vnd.google-apps.spreadsheet":
+        return service.files().export_media(
+            fileId=file_id,
+            mimeType="text/csv"
+        ).execute()
+
+    elif mime_type == "application/vnd.google-apps.presentation":
+        return service.files().export_media(
+            fileId=file_id,
+            mimeType="text/plain"
+        ).execute()
+
+    else:
+        return service.files().get_media(fileId=file_id).execute()
+
+# ==============================
+# 🔷 GLOBAL STORE (IN MEMORY CACHE)
+# ==============================
+index = load_index()
+chunks = json.load(open(CHUNKS_PATH)) if os.path.exists(CHUNKS_PATH) else []
+meta = json.load(open(META_PATH)) if os.path.exists(META_PATH) else []
+
+# ==============================
+# 🔷 SAVE STORE
+# ==============================
+def save_store():
+    os.makedirs(BASE_PATH, exist_ok=True)
+    faiss.write_index(index, INDEX_PATH)
+    json.dump(chunks, open(CHUNKS_PATH, "w"))
+    json.dump(meta, open(META_PATH, "w"))
+
+# ==============================
+# 🔷 SYNC DRIVE (ENTERPRISE)
 # ==============================
 def sync_drive():
-    global chunks, meta, index
-
-    print("🔄 Syncing Google Drive...")
+    global index, chunks, meta
 
     service = get_drive_service()
+    state = load_state()
 
     files = service.files().list(
-        pageSize=20,
-        fields="files(id, name)"
+        pageSize=100,
+        fields="files(id,name,mimeType,modifiedTime)"
     ).execute().get("files", [])
 
-    new_chunks = []
-    new_meta = []
-    new_index = faiss.IndexFlatL2(EMBED_DIM)
-
     for f in files:
+        file_id = f["id"]
+
+        # skip unchanged file
+        if file_id in state and state[file_id] == f["modifiedTime"]:
+            continue
+
         try:
-            content = service.files().get_media(fileId=f["id"]).execute()
-            text = content.decode("utf-8", errors="ignore")
+            file_bytes = download_file(service, file_id, f["mimeType"])
+            text = extract_text(file_bytes, f["mimeType"])
+
+            if not text.strip():
+                continue
 
             for c in chunk_text(text):
                 vec = embed(c)
 
-                new_index.add(np.array([vec]))
-                new_chunks.append(c)
-                new_meta.append({"file": f["name"]})
+                index.add(np.array([vec]))
+                chunks.append(c)
+                meta.append({
+                    "file": f["name"],
+                    "type": f["mimeType"]
+                })
+
+            state[file_id] = f["modifiedTime"]
 
         except Exception as e:
-            print(f"Skip {f['name']}: {e}")
+            print("skip:", f["name"], e)
 
-    # atomic swap (IMPORTANT)
-    with lock:
-        chunks = new_chunks
-        meta = new_meta
-        index = new_index
+    save_store()
+    save_state(state)
 
-    print(f"✅ Sync complete. chunks={len(chunks)}")
+    print("✅ SYNC DONE:", len(chunks))
 
 # ==============================
-# 🔁 AUTO SYNC LOOP
+# 🔷 SEARCH
 # ==============================
-def auto_sync_loop():
-    while True:
-        try:
-            sync_drive()
-        except Exception as e:
-            print("❌ Sync error:", e)
-
-        time.sleep(SYNC_INTERVAL)
-
-# ==============================
-# 🔷 SEARCH (VECTOR)
-# ==============================
-def search(query, k=3):
+def search(query, k=5):
     if len(chunks) == 0:
         return []
 
@@ -154,30 +225,41 @@ def search(query, k=3):
     return results
 
 # ==============================
-# 🔷 STARTUP EVENT (AUTO SYNC)
+# 🔷 BACKGROUND SYNC (OPTIONAL)
+# ==============================
+def background_sync():
+    while True:
+        try:
+            sync_drive()
+        except Exception as e:
+            print("sync error:", e)
+
+        time.sleep(300)  # 5 min
+
+# ==============================
+# 🔷 STARTUP
 # ==============================
 @app.on_event("startup")
-def startup_event():
-    print("🚀 Starting KB AI...")
-
-    # initial sync
-    sync_drive()
-
-    # background thread
-    thread = threading.Thread(target=auto_sync_loop, daemon=True)
-    thread.start()
-
-    print("🔁 Auto-sync enabled")
+def startup():
+    threading.Thread(target=background_sync, daemon=True).start()
 
 # ==============================
 # 🔷 ROOT
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "RAG KB AI AUTO-SYNC RUNNING"}
+    return {"status": "Enterprise RAG running"}
 
 # ==============================
-# 🔷 CHAT API (RAG)
+# 🔷 MANUAL SYNC
+# ==============================
+@app.post("/sync")
+def manual_sync():
+    sync_drive()
+    return {"status": "synced"}
+
+# ==============================
+# 🔷 CHAT (RAG)
 # ==============================
 @app.get("/chat")
 def chat(q: str):
@@ -189,15 +271,15 @@ def chat(q: str):
     )
 
     response = client.models.generate_content(
-        model="gemini-flash-latest",
+        model="gemini-1.5-flash",
         contents=f"""
-You are an internal knowledge base AI.
+You are an enterprise internal knowledge assistant.
 
-Use ONLY the following context:
+Use ONLY this context:
 
 {context}
 
-If the answer is not found in the context, respond with: "not found".
+If not found, answer: not found.
 
 Question:
 {q}
@@ -205,87 +287,34 @@ Question:
     )
 
     return {
-        "question": q,
         "answer": response.text,
-        "sources": [d["meta"]["file"] for d in docs]
+        "sources": list(set([d["meta"]["file"] for d in docs]))
     }
 
 # ==============================
-# 🔷 CHAT UI (STEP 9)
+# 🔷 UI
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
     return """
-    <!DOCTYPE html>
     <html>
-    <head>
-        <title>KB Team East AI Chat</title>
-        <style>
-            body {
-                font-family: Arial;
-                margin: 40px;
-                background: #f5f5f5;
-            }
-            #chat {
-                border: 1px solid #ccc;
-                background: white;
-                padding: 10px;
-                height: 450px;
-                overflow-y: auto;
-                margin-bottom: 10px;
-            }
-            input {
-                width: 75%;
-                padding: 10px;
-            }
-            button {
-                padding: 10px 15px;
-            }
-            .user { color: blue; margin: 5px 0; }
-            .ai { color: green; margin: 5px 0; }
-        </style>
-    </head>
     <body>
-
-        <h2>📚 KB Team East AI Chat (Auto-Sync)</h2>
-
+        <h2>Enterprise RAG Chat</h2>
+        <input id="q" placeholder="Ask..." />
+        <button onclick="send()">Send</button>
         <div id="chat"></div>
 
-        <input id="msg" placeholder="Ask me anything..." />
-        <button onclick="send()">Send</button>
-
         <script>
-            async function send() {
-                let msg = document.getElementById("msg").value;
+        async function send(){
+            let q = document.getElementById("q").value;
+            let res = await fetch("/chat?q=" + q);
+            let data = await res.json();
 
-                if (!msg) return;
-
-                document.getElementById("chat").innerHTML +=
-                    "<div class='user'><b>You:</b> " + msg + "</div>";
-
-                let res = await fetch("/chat?q=" + encodeURIComponent(msg));
-                let data = await res.json();
-
-                document.getElementById("chat").innerHTML +=
-                    "<div class='ai'><b>AI:</b> " + data.answer + "</div><br>";
-
-                document.getElementById("msg").value = "";
-
-                document.getElementById("chat").scrollTop =
-                    document.getElementById("chat").scrollHeight;
-            }
+            document.getElementById("chat").innerHTML +=
+                "<p><b>You:</b> " + q + "</p>" +
+                "<p><b>AI:</b> " + data.answer + "</p><hr/>";
+        }
         </script>
-
     </body>
     </html>
     """
-
-# ==============================
-# 🔷 RAILWAY ENTRY POINT
-# ==============================
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", 8000))
-
-    uvicorn.run(app, host="0.0.0.0", port=port)
