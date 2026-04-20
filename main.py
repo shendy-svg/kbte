@@ -2,8 +2,6 @@ import os
 import json
 import base64
 import numpy as np
-import threading
-import time
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -24,26 +22,24 @@ app = FastAPI()
 load_dotenv()
 
 # ==============================
-# 🔷 GEMINI CLIENT (FIXED MODEL)
+# 🔷 GEMINI CLIENT
 # ==============================
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-MODEL_NAME = "gemini-flash-latest"
+MODEL = "gemini-1.5-flash-latest"
 
 # ==============================
-# 🔷 STORAGE (RAILWAY PERSISTENT)
+# 🔷 STORAGE (Railway)
 # ==============================
 BASE = "/data"
 
 INDEX_PATH = f"{BASE}/index.faiss"
 CHUNKS_PATH = f"{BASE}/chunks.json"
 META_PATH = f"{BASE}/meta.json"
-STATE_PATH = f"{BASE}/state.json"
 
 EMBED_DIM = 768
 
 # ==============================
-# 🔷 FAISS INIT
+# 🔷 LOAD FAISS
 # ==============================
 def load_index():
     if os.path.exists(INDEX_PATH):
@@ -82,38 +78,23 @@ def embed(text):
     return np.array(res.embeddings[0].values, dtype=np.float32)
 
 # ==============================
-# 🔷 CHUNKING
+# 🔷 CHUNK
 # ==============================
 def chunk_text(text, size=800):
     return [text[i:i+size] for i in range(0, len(text), size)]
 
 # ==============================
-# 🔷 PDF PARSER
+# 🔷 PDF EXTRACT
 # ==============================
 def extract_pdf(file_bytes):
     reader = PdfReader(BytesIO(file_bytes))
     return "\n".join([p.extract_text() or "" for p in reader.pages])
 
 # ==============================
-# 🔷 DOWNLOAD FILE FROM DRIVE
-# ==============================
-def download_file(service, file_id, mime):
-
-    if mime == "application/vnd.google-apps.document":
-        return service.files().export_media(fileId=file_id, mimeType="text/plain").execute()
-
-    if mime == "application/vnd.google-apps.spreadsheet":
-        return service.files().export_media(fileId=file_id, mimeType="text/csv").execute()
-
-    if mime == "application/vnd.google-apps.presentation":
-        return service.files().export_media(fileId=file_id, mimeType="text/plain").execute()
-
-    return service.files().get_media(fileId=file_id).execute()
-
-# ==============================
-# 🔷 SEARCH (RAG)
+# 🔷 SEARCH
 # ==============================
 def search(query, k=5):
+
     if len(chunks) == 0:
         return []
 
@@ -121,6 +102,7 @@ def search(query, k=5):
     D, I = index.search(np.array([q]), k)
 
     results = []
+
     for i in I[0]:
         if i < len(chunks):
             results.append({
@@ -131,77 +113,34 @@ def search(query, k=5):
     return results
 
 # ==============================
-# 🔥 SYNC DRIVE (MANUAL / AUTO READY)
-# ==============================
-def sync_drive():
-    global index, chunks, meta
-
-    service = get_drive_service()
-    state = {}
-
-    files = service.files().list(
-        pageSize=100,
-        fields="files(id,name,mimeType,modifiedTime)"
-    ).execute().get("files", [])
-
-    for f in files:
-        try:
-            raw = download_file(service, f["id"], f["mimeType"])
-
-            if f["mimeType"] == "application/pdf":
-                text = extract_pdf(raw)
-            else:
-                text = raw.decode("utf-8", errors="ignore")
-
-            if not text.strip():
-                continue
-
-            for c in chunk_text(text):
-                vec = embed(c)
-
-                index.add(np.array([vec]))
-                chunks.append(c)
-                meta.append({
-                    "file": f["name"],
-                    "type": f["mimeType"]
-                })
-
-        except Exception as e:
-            print("skip:", f["name"], e)
-
-    print("sync done:", len(chunks))
-
-# ==============================
-# 🔥 CHAT ENGINE (RAG + FALLBACK)
+# 🔷 CHAT ENGINE (SAFE)
 # ==============================
 @app.get("/chat")
 def chat(q: str):
 
-    docs = search(q)
+    try:
+        docs = search(q)
 
-    context = "\n\n".join(
-        [f"{d['meta']['file']}:\n{d['text']}" for d in docs]
-    )
+        context = "\n\n".join(
+            [f"{d['meta']['file']}:\n{d['text']}" for d in docs]
+        ).strip()
 
-    # ======================
-    # INTERNAL RAG MODE
-    # ======================
-    if context.strip():
+        # ======================
+        # INTERNAL RAG
+        # ======================
+        if context:
 
-        prompt = f"""
+            res = client.models.generate_content(
+                model=MODEL,
+                contents=f"""
 You are an enterprise AI assistant.
 
-TASK:
-- Answer using internal documents only
+RULES:
+- Use ONLY internal documents
+- Provide clear answer
 - Provide reasoning
-- Provide sources (file names)
 - Provide suggestions (2-3)
-
-FORMAT:
-Answer:
-Reasoning:
-Sources:
-Suggestions:
+- Provide sources
 
 DOCUMENTS:
 {context}
@@ -209,55 +148,51 @@ DOCUMENTS:
 QUESTION:
 {q}
 """
+            )
 
+            return {
+                "mode": "internal-rag",
+                "answer": res.text,
+                "sources": list(set([d["meta"]["file"] for d in docs]))
+            }
+
+        # ======================
+        # EXTERNAL AI
+        # ======================
         res = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt
-        )
+            model=MODEL,
+            contents=f"""
+You are a helpful AI assistant.
 
-        return {
-            "mode": "internal-rag",
-            "answer": res.text,
-            "sources": list(set([d["meta"]["file"] for d in docs]))
-        }
-
-    # ======================
-    # EXTERNAL FALLBACK
-    # ======================
-    prompt = f"""
-You are a senior AI assistant.
-
-The question is NOT found in internal documents.
-
-TASK:
-- Answer clearly using general knowledge
-- Provide reasoning
-- Provide suggestions
+Answer the question clearly with reasoning and suggestions.
 
 QUESTION:
 {q}
 """
+        )
 
-    res = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt
-    )
+        return {
+            "mode": "external-ai",
+            "answer": res.text,
+            "sources": []
+        }
 
-    return {
-        "mode": "external-ai",
-        "answer": res.text,
-        "sources": []
-    }
+    except Exception:
+        return {
+            "mode": "fallback",
+            "answer": "AI service temporarily unavailable. Please try again.",
+            "sources": []
+        }
 
 # ==============================
-# 🔥 ROOT
+# 🔷 ROOT
 # ==============================
 @app.get("/")
 def home():
-    return {"status": "KB Team East AI running"}
+    return {"status": "Enterprise RAG AI running"}
 
 # ==============================
-# 🔥 UI (CHATGPT STYLE FIXED)
+# 🔷 UI (CHATGPT STYLE + ENTER FIX)
 # ==============================
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -265,65 +200,18 @@ def ui():
 <!DOCTYPE html>
 <html>
 <head>
-<title>KB Team East AI</title>
+<title>Enterprise RAG AI</title>
 
 <style>
-body {
-    margin:0;
-    font-family: Arial;
-    background:#0b1220;
-    color:white;
-}
-
-.container {
-    max-width: 800px;
-    margin: auto;
-    padding: 20px;
-}
-
-.chat {
-    height: 70vh;
-    overflow-y: auto;
-    background: #111827;
-    padding: 15px;
-    border-radius: 10px;
-}
-
-.msg {
-    margin: 10px 0;
-    padding: 10px;
-    border-radius: 10px;
-}
-
-.user {
-    background:#2563eb;
-    text-align:right;
-}
-
-.ai {
-    background:#1f2937;
-}
-
-.input {
-    display:flex;
-    margin-top:10px;
-}
-
-input {
-    flex:1;
-    padding:12px;
-    border:none;
-    border-radius:8px;
-}
-
-button {
-    margin-left:10px;
-    padding:12px;
-    background:#22c55e;
-    border:none;
-    border-radius:8px;
-    cursor:pointer;
-}
+body {margin:0;font-family:Arial;background:#0b1220;color:#fff;}
+.container {max-width:800px;margin:auto;padding:20px;}
+.chat {height:70vh;overflow-y:auto;background:#111827;padding:15px;border-radius:10px;}
+.msg {margin:10px 0;padding:10px;border-radius:10px;}
+.user {background:#2563eb;text-align:right;}
+.ai {background:#1f2937;}
+.input {display:flex;margin-top:10px;}
+input {flex:1;padding:12px;border:none;border-radius:8px;}
+button {margin-left:10px;padding:12px;background:#22c55e;border:none;border-radius:8px;cursor:pointer;}
 </style>
 
 </head>
@@ -331,7 +219,7 @@ button {
 <body>
 
 <div class="container">
-<h2>🧠 KB Team East AI</h2>
+<h2>🧠 Enterprise RAG AI</h2>
 
 <div id="chat" class="chat"></div>
 
@@ -367,6 +255,16 @@ document.getElementById("q").value = "";
 chat.scrollTop = chat.scrollHeight;
 }
 
+/* 🔥 ENTER KEY = SEND */
+document.addEventListener("DOMContentLoaded", function () {
+    document.getElementById("q").addEventListener("keypress", function (e) {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            send();
+        }
+    });
+});
+
 </script>
 
 </body>
@@ -374,7 +272,7 @@ chat.scrollTop = chat.scrollHeight;
 """
 
 # ==============================
-# 🔥 STARTUP OPTION
+# 🔷 RUN
 # ==============================
 if __name__ == "__main__":
     import uvicorn
