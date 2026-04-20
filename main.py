@@ -26,7 +26,7 @@ load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # 🔥 FIX: model
-MODEL = "gemini-1.5-flash"
+MODEL = "models/gemini-1.5-flash"
 
 # ==============================
 # STORAGE
