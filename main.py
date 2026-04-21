@@ -32,7 +32,7 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-PRIMARY_MODEL = "gemini-2.5-flash"
+PRIMARY_MODEL = "gemini-flash-latest"
 FALLBACK_MODEL = "gemini-1.5-flash"
 
 # ==============================
